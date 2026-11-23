@@ -1,0 +1,118 @@
+module PaperContrastTraining
+
+import Data.List
+import Data.Text
+import System
+
+-- Ground truth exists in page coordinates; the camera only returns a brightness.
+printed_ink : Int → Int → Int → Bool
+printed_ink sheet column row =
+  let wire = 4 + sheet `mod` 10
+      rail = 4 + (sheet `div` 10) `mod` 8
+      gap = 2 + (3 × sheet) `mod` 19 in
+  column ≟ wire || (row ≟ rail && abs (column - gap) > 1) ||
+  (abs (column - wire) <= 1 && abs (row - rail) <= 1)
+
+camera_sample : Int → Int → Int → Int → Int
+camera_sample sheet camera column row =
+  let flash_x = 5 + (sheet × 7 + camera × 9) `mod` 14
+      flash_y = 5 + (sheet × 3 + camera × 5) `mod` 14
+      dx = column - flash_x
+      dy = row - flash_y
+      paper = 164 + (sheet × 11 + camera × 17) `mod` 40 + column + row `div` 2
+      strength = 13 + (sheet × 13 + camera × 19) `mod` 44
+      noise = (column × 11 + row × 7 + sheet + camera × 5) `mod` 13 - 6
+      ink_loss = if printed_ink sheet column row then strength else 0 in
+  if dx × dx + dy × dy <= 36 then 255 else paper - ink_loss + noise
+
+-- Only image samples enter these features. A saturated neighbor supplies no
+-- local background reference; a saturated center supplies no observation.
+view_contrast : Int → Int → Int → Int → Maybe Int
+view_contrast sheet camera column row =
+  let sample = camera_sample sheet camera
+      centre = sample column row
+      neighbors = [sample (column - 1) row, sample (column + 1) row,
+                   sample column (row - 1), sample column (row + 1)]
+      usable = filter (< 255) neighbors in
+  if centre >= 255 then Nothing else
+    case usable of
+      [] ⇒ Nothing
+      first :: rest ⇒ Just (max 0 (foldl max first rest - centre))
+
+strongest : Maybe Int → Maybe Int → Maybe Int
+strongest Nothing other = other
+strongest first Nothing = first
+strongest (Just first) (Just second) = Just (max first second)
+
+record Example where
+  constructor Witness
+  ink : Bool
+  contrast : Maybe Int
+
+sheet_examples : Int → List Example
+sheet_examples sheet =
+  [ Witness (printed_ink sheet column row)
+      (strongest (view_contrast sheet 0 column row) (view_contrast sheet 1 column row))
+  | column ← [1..22], row ← [1..22] ]
+
+record Counts where
+  constructor Scored
+  preserved : Int
+  missed : Int
+  invented : Int
+  clear : Int
+  unknown : Int
+
+count_sample : Int → Counts → Example → Counts
+count_sample threshold counts item =
+  case item.contrast of
+    Nothing ⇒ { unknown $= (+ 1) } counts
+    Just value ⇒
+      case (item.ink, value >= threshold) of
+        (True, True) ⇒ { preserved $= (+ 1) } counts
+        (True, False) ⇒ { missed $= (+ 1) } counts
+        (False, True) ⇒ { invented $= (+ 1) } counts
+        (False, False) ⇒ { clear $= (+ 1) } counts
+
+score : List Example → Int → Counts
+score examples threshold = foldl (count_sample threshold) (Scored 0 0 0 0 0) examples
+
+cost : Counts → Int
+cost counts = 3 × counts.missed + counts.invented
+
+prefer_lower_cost : (Int, Int) → (Int, Int) → (Int, Int)
+prefer_lower_cost best candidate = if snd candidate < snd best then candidate else best
+
+fit_threshold : List Example → Int
+fit_threshold examples =
+  let trial = \threshold ⇒ (threshold, cost (score examples threshold)) in
+  fst (foldl prefer_lower_cost (trial 1) (map trial [2..64]))
+
+report : Text → Int → Counts → IO ()
+report label threshold counts = putStrLn (label ++ "\t" ++ show threshold ++ "\t" ++
+  show counts.preserved ++ "\t" ++ show counts.missed ++ "\t" ++ show counts.invented ++ "\t" ++
+  show counts.clear ++ "\t" ++ show counts.unknown ++ "\t" ++ show (cost counts))
+
+complete : Int → Counts → Bool
+complete expected counts =
+  counts.preserved + counts.missed > 0 && counts.invented + counts.clear > 0 &&
+  counts.unknown > 0 &&
+  counts.preserved + counts.missed + counts.invented + counts.clear + counts.unknown ≟ expected
+
+covering
+main : IO ()
+main = do
+  let sheets = the (List Int) [0..79]
+  let training = concatMap sheet_examples (filter (\sheet ⇒ not (sheet `mod` 5 ≟ 0)) sheets)
+  let held_out = concatMap sheet_examples (filter (\sheet ⇒ sheet `mod` 5 ≟ 0) sheets)
+  let threshold = fit_threshold training
+  let fitted = score training threshold
+  let comparison = score training 32
+  let evaluated = score held_out threshold
+  putStrLn "split\tthreshold\tink_preserved\tink_missed\tmarks_invented\tbackground_clear\tunknown\tweighted_errors"
+  report "train_fixed" 32 comparison
+  report "train_fitted" threshold fitted
+  report "held_out_fixed" 32 (score held_out 32)
+  report "held_out_fitted" threshold evaluated
+  if complete (64 × 484) fitted && complete (16 × 484) evaluated && cost fitted <= cost comparison
+    then pure () else exitFailure
